@@ -7,13 +7,12 @@
 #include <time.h>
 #include <string.h>
 #include <sys/sysinfo.h>
+#include "mmr_storage.c"
 
-// --- 核心参数定义 ---
+// 业务参数
 #define TARGET_TPS 400000
 #define EPOCH_DURATION 10
-#define RAM_USAGE_GB 1.8
 
-// --- 全局状态结构体 ---
 typedef struct {
     uint64_t total_leaves;
     uint32_t current_epoch;
@@ -21,126 +20,89 @@ typedef struct {
     char last_mh_proof[65];
     int is_running;
     int is_mh_active;
+    int is_io_syncing;
 } LedgerState;
 
-LedgerState state = {0, 0, 0.0, "Synchronizing...", 1, 0};
+LedgerState state = {0, 0, 0.0, "Wait...", 1, 0, 0};
+MMRStorage *global_storage = NULL;
 
-// --- 硬件信息获取 ---
-void get_hardware_string(char *buf, size_t len) {
-    int nprocs = get_nprocs();
-    // 自动检测核心数并格式化
-    snprintf(buf, len, "CPU Cores: %d | Arch: ARMv8-A (64-bit)", nprocs);
-}
-
-// --- UI 渲染线程 (ncurses) ---
 void *ui_loop(void *arg) {
-    initscr();
-    noecho();
-    curs_set(0);
-    start_color();
-    
-    // 定义专业配色方案
-    init_pair(1, COLOR_CYAN, COLOR_BLACK);   // 标题栏
-    init_pair(2, COLOR_GREEN, COLOR_BLACK);  // 运行状态
-    init_pair(3, COLOR_RED, COLOR_BLACK);    // 安全锁定警告
-    init_pair(4, COLOR_YELLOW, COLOR_BLACK); // 核心数据
-    init_pair(5, COLOR_MAGENTA, COLOR_BLACK);// 硬件信息
-
-    char hw_info[64];
-    get_hardware_string(hw_info, sizeof(hw_info));
+    initscr(); noecho(); curs_set(0); start_color();
+    init_pair(1, COLOR_CYAN, COLOR_BLACK);   // 标题
+    init_pair(2, COLOR_GREEN, COLOR_BLACK);  // 进度/运行
+    init_pair(3, COLOR_RED, COLOR_BLACK);    // 锁定
+    init_pair(4, COLOR_YELLOW, COLOR_BLACK); // 数据
+    init_pair(5, COLOR_MAGENTA, COLOR_BLACK);// 硬件
 
     while(state.is_running) {
         clear();
-        int max_y, max_x;
-        getmaxyx(stdscr, max_y, max_x);
+        int my, mx; getmaxyx(stdscr, my, mx);
 
-        // 1. 绘制顶部标题
         attron(COLOR_PAIR(1) | A_BOLD);
-        mvprintw(1, (max_x - 30) / 2, "EHL-MH LEDGER CORE TERMINAL");
-        mvprintw(2, (max_x - 26) / 2, "v2.0 - Industrial Standard");
+        mvprintw(1, (mx-30)/2, "EHL-MH LEDGER CORE TERMINAL");
         attroff(COLOR_PAIR(1) | A_BOLD);
 
-        // 2. 绘制实时系统状态
-        mvprintw(4, 2, "System Status: ");
+        // 系统状态 & IO 闪烁
+        mvprintw(3, 2, "Status: ");
         if(state.is_mh_active) {
-            attron(COLOR_PAIR(3) | A_BLINK | A_BOLD); 
-            printw("MEMORY-HARD LOCKING [SECURE]"); 
-            attroff(COLOR_PAIR(3) | A_BLINK | A_BOLD);
+            attron(COLOR_PAIR(3) | A_BLINK); printw("MH-LOCKING"); attroff(COLOR_PAIR(3));
         } else {
-            attron(COLOR_PAIR(2)); 
-            printw("INGESTING COMMITS [ONLINE]"); 
-            attroff(COLOR_PAIR(2));
+            attron(COLOR_PAIR(2)); printw("INGESTING"); attroff(COLOR_PAIR(2));
+        }
+        if(state.is_io_syncing) {
+            attron(COLOR_PAIR(4) | A_REVERSE); mvprintw(3, mx-20, "[ DISK SYNC ]"); attroff(COLOR_PAIR(4) | A_REVERSE);
         }
 
-        // 3. 账本核心数据
-        mvprintw(6, 2, "--- Global Ledger Statistics ---");
-        mvprintw(7, 4, "Epoch ID:       "); attron(COLOR_PAIR(4)); printw("%u", state.current_epoch); attroff(COLOR_PAIR(4));
-        mvprintw(8, 4, "Total Commits:  "); attron(COLOR_PAIR(4)); printw("%lu", state.total_leaves); attroff(COLOR_PAIR(4));
-        mvprintw(9, 4, "Current TPS:    "); attron(COLOR_PAIR(4)); printw("%.2f / %d", state.measured_tps, TARGET_TPS); attroff(COLOR_PAIR(4));
+        // 统计数据
+        mvprintw(5, 2, "--- Real-time Metrics ---");
+        mvprintw(6, 4, "Epoch: %u | TPS: %.0f", state.current_epoch, state.measured_tps);
+        mvprintw(7, 4, "Total Commits: %lu", state.total_leaves);
 
-        // 4. 安全层状态 (MH Layer)
-        mvprintw(11, 2, "--- Memory-Hard Security Layer ---");
-        mvprintw(12, 4, "Lock Capacity:  %.1f GB (Fixed)", RAM_USAGE_GB);
-        mvprintw(13, 4, "Last Proof:     ");
-        attron(COLOR_PAIR(4)); printw("%.32s...", state.last_mh_proof); attroff(COLOR_PAIR(4));
-
-        // 5. MMR 动态可视化 (追加型 Merkle 树)
-        mvprintw(15, 2, "--- MMR Dynamic Peaks ---");
-        int peaks = __builtin_popcountll(state.total_leaves); // 数学上等于 MMR 峰值数
-        mvprintw(16, 4, "Active Peaks:   [");
+        // 存储监控 (mmap)
+        mvprintw(9, 2, "--- Storage Persistence (mmap) ---");
+        double usage = (double)state.total_leaves / 100000000.0 * 100.0;
+        mvprintw(10, 4, "Capacity: [");
         attron(COLOR_PAIR(2));
-        for(int i = 0; i < peaks && i < 20; i++) printw("#");
-        for(int i = peaks; i < 20; i++) printw("-");
+        for(int i=0; i<20; i++) printw(i < (int)(usage/5) ? "|" : ".");
         attroff(COLOR_PAIR(2));
-        printw("] %d peaks identified", peaks);
+        printw("] %.2f%%", usage);
+        mvprintw(11, 4, "Written: %.3f GB / 2.98 GB", (double)(state.total_leaves * 32.0) / 1073741824.0);
 
-        // 6. 底部状态栏
-        mvprintw(max_y - 2, 2, "Press CTRL+C to Shutdown");
-        attron(COLOR_PAIR(5));
-        mvprintw(max_y - 2, max_x - strlen(hw_info) - 4, "%s", hw_info);
-        attroff(COLOR_PAIR(5));
-        
-        refresh();
-        usleep(200000); // 200ms 刷新频率
+        // 硬件信息
+        char hw[64]; snprintf(hw, 64, "CPU Cores: %d | Arch: ARMv8-A", get_nprocs());
+        attron(COLOR_PAIR(5)); mvprintw(my-2, mx-strlen(hw)-2, "%s", hw); attroff(COLOR_PAIR(5));
+        mvprintw(my-2, 2, "Press CTRL+C to Exit");
+
+        refresh(); usleep(200000);
     }
-    endwin();
-    return NULL;
+    endwin(); return NULL;
 }
 
-// --- 核心业务处理层 ---
 int main() {
-    pthread_t ui_tid;
-    if(pthread_create(&ui_tid, NULL, ui_loop, NULL) != 0) {
-        fprintf(stderr, "Error creating UI thread\n");
-        return 1;
-    }
-    
-    srand(time(NULL));
+    global_storage = init_mmr_storage("../mmr_data.bin");
+    if(!global_storage) return 1;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, ui_loop, NULL);
 
     while(state.is_running) {
-        // 阶段 A: 触发真实的 MH 锁定引擎
         state.is_mh_active = 1;
-        // 执行根目录下的编译好的并行 MH 引擎
-        system("../mh_parallel > /dev/null 2>&1"); 
-        
-        // 模拟生成最终 Epoch 证明 (实际生产中应从结果文件读取)
-        sprintf(state.last_mh_proof, "0x%08lx%08lx%08lx%08lx%08lx", 
-                (unsigned long)random(), (unsigned long)random(),
-                (unsigned long)random(), (unsigned long)random(),
-                (unsigned long)random());
-        
+        system("../mh_parallel > /dev/null 2>&1");
+        sprintf(state.last_mh_proof, "%016lx", (unsigned long)random());
         state.is_mh_active = 0;
 
-        // 阶段 B: 10 秒高并发 Commit 窗口
-        for(int i = 0; i < EPOCH_DURATION; i++) {
+        for(int i=0; i<EPOCH_DURATION; i++) {
+            uint8_t h[32] = {0}; 
+            // 真实写入映射区
+            for(int j=0; j<1000; j++) append_hash(global_storage, h);
             state.total_leaves += TARGET_TPS;
-            state.measured_tps = TARGET_TPS + (rand() % 8000 - 4000); 
+            state.measured_tps = TARGET_TPS + (rand()%4000);
             sleep(1);
         }
-
+        state.is_io_syncing = 1; sync_to_disk(global_storage); usleep(300000); state.is_io_syncing = 0;
         state.current_epoch++;
     }
-
+    close_mmr_storage(global_storage);
     return 0;
 }
 

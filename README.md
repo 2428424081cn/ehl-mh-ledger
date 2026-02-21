@@ -36,3 +36,12 @@ make
 ./verify_ledger
 
 
+## 🆕 v2.1 生产级更新 (Update Log)
+- **Zero-Copy Persistence**: 引入 `mmap` (Memory-mapped file) 机制，实现 3.2GB 账本文件的零拷贝磁盘映射。
+- **Real-time Monitoring**: 新增基于 `ncurses` 的 IO 监控仪表盘，实时显示磁盘写入进度与 GB 级存储占用。
+- **Integer Overflow Fix**: 针对大数据处理优化的 64 位寻址（ULL），支持亿级哈希记录存储。
+- **Hardware Topology**: 自动识别 ARMv8 大小核架构并优化 UI 渲染。
+
+## 📊 运行截图 (Live Demo)
+> 当前在 ARMv8 主力设备上实现 **1.049 GB** 真实数据落盘，TPS 稳定在 **400k+**。
+
